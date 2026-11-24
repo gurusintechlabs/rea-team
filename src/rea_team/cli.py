@@ -52,8 +52,7 @@ def cmd_init(args) -> int:
     print(f"\nWorkspace ready at {root}\n\nNext (details in docs/USER_GUIDE.md):\n"
           f"  1. Copy the app into lab/target/  (binary, install folder, source tree, JAR...)\n"
           f"  2. Edit rea-team.toml: [project] stack + test_command, [verify]\n"
-          f"  3. If you use REA: cd lab && rea doctor --json > analysis/doctor.json\n"
-          f"     then: rea-team set-tools --from-doctor lab/analysis/doctor.json\n"
+          f"  3. If you use REA: rea-team set-tools   (asks `rea --mcp` for its tool names)\n"
           f"  4. Start the clean container, then: rea-team doctor\n"
           f"  5. rea-team plan target/<app> --authorized")
     return 0
@@ -86,10 +85,10 @@ def cmd_set_tools(args) -> int:
     elif args.from_doctor:
         tools = preflight.extract_rea_tools(Path(args.from_doctor))
     else:
-        raise ReaTeamError("Pass --tools a,b,c or --from-doctor path/to/doctor.json")
+        tools = preflight.list_mcp_tools(args.from_mcp)
     if not tools:
         raise ReaTeamError("No REA tool names found.",
-                           hint="Open doctor.json, find the tool catalog and pass the names with --tools.")
+                           hint="Run `rea-team set-tools` with no options to ask `rea --mcp`, or pass --tools.")
     path = preflight.set_analyst_tools(cfg, tools)
     print(f"Set {len(tools)} REA tools in {path}:\n  " + "\n  ".join(tools))
     return 0
@@ -292,8 +291,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_doctor)
 
     s = sub.add_parser("set-tools", help="fill the analyst's REA tools line")
-    s.add_argument("--from-doctor")
-    s.add_argument("--tools", help="comma-separated REA tool names")
+    src = s.add_mutually_exclusive_group()
+    src.add_argument("--from-mcp", default="rea --mcp", metavar="CMD",
+                     help="ask this stdio MCP server for its tools (default: %(default)s)")
+    src.add_argument("--from-doctor", metavar="FILE", help="read tool names from `rea doctor --json` output")
+    src.add_argument("--tools", help="comma-separated REA tool names")
     s.set_defaults(fn=cmd_set_tools)
 
     s = sub.add_parser("plan", help="survey the app, propose features, write CONTRACTS.md")

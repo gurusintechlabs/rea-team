@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import json
+import queue
 import re
+import shlex
 import shutil
+import subprocess
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,7 +63,7 @@ def _agent_checks(cfg: Config, needs_rea: bool = True) -> list[Check]:
     elif any(PLACEHOLDER in t or "<" in t for t in analyst):
         if needs_rea:
             out.append(Check("analyst agent", False,
-                             "tools line still has a placeholder; run `rea-team set-tools` after `rea doctor --json`"))
+                             "tools line still has a placeholder; run `rea-team set-tools`"))
         else:
             out.append(Check("analyst agent", True, "no REA needed; the unused placeholder is removed at run time"))
     elif needs_rea and not any(t.startswith(REA_PREFIX) for t in analyst):
@@ -156,13 +161,85 @@ def run_checks(cfg: Config, runner: Runner, *, targets: list[str] | None = None,
     return checks
 
 
-def extract_rea_tools(doctor_json: Path) -> list[str]:
-    """Best-effort pull of tool names from `rea doctor --json` output."""
+def list_mcp_tools(command: str = "rea --mcp", timeout: float = 60) -> list[str]:
+    """Ask an MCP server over stdio for its tool names (initialize, then tools/list until no cursor)."""
     try:
-        data = json.loads(doctor_json.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        raise ReaTeamError(f"Cannot read {doctor_json}: {e}",
-                           hint="Run `rea doctor --json > lab/analysis/doctor.json`, or pass --tools.") from e
+        proc = subprocess.Popen(shlex.split(command), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+    except OSError as e:
+        raise ReaTeamError(f"Cannot start MCP server `{command}`: {e}",
+                           hint="Install REA, or pass --from-mcp with the right command, or --tools.") from e
+    lines: queue.Queue = queue.Queue()
+
+    def pump() -> None:  # a thread so a silent server cannot block us past the deadline
+        for line in proc.stdout:
+            lines.put(line)
+        lines.put(None)
+
+    threading.Thread(target=pump, daemon=True).start()
+    deadline = time.monotonic() + timeout
+
+    def send(msg: dict) -> None:
+        proc.stdin.write(json.dumps(msg) + "\n")
+        proc.stdin.flush()
+
+    def reply(msg_id: int) -> dict:
+        while True:
+            try:
+                line = lines.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
+                raise ReaTeamError(f"MCP server `{command}` did not answer within {timeout:.0f}s") from None
+            if line is None:
+                raise ReaTeamError(f"MCP server `{command}` exited before listing its tools")
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # stray log output on stdout
+            if msg.get("id") == msg_id:
+                if "error" in msg:
+                    raise ReaTeamError(f"MCP server `{command}` returned an error: {msg['error']}")
+                return msg.get("result") or {}
+
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                         "clientInfo": {"name": "rea-team", "version": "0"}}})
+        reply(1)
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        names: list[str] = []
+        cursor, msg_id = None, 2
+        while True:
+            send({"jsonrpc": "2.0", "id": msg_id, "method": "tools/list",
+                  "params": {"cursor": cursor} if cursor else {}})
+            result = reply(msg_id)
+            names += [t["name"] for t in result.get("tools", []) if isinstance(t.get("name"), str)]
+            cursor, msg_id = result.get("nextCursor"), msg_id + 1
+            if not cursor:
+                break
+    except (BrokenPipeError, OSError) as e:
+        raise ReaTeamError(f"MCP server `{command}` closed its input: {e}") from e
+    finally:
+        proc.kill()
+        proc.wait()
+    return [n if n.startswith(REA_PREFIX) else REA_PREFIX + n for n in names]
+
+
+def extract_rea_tools(doctor_json: Path) -> list[str]:
+    """Best-effort pull of tool names from `rea doctor --json` output.
+
+    Recent REA versions (6.x) only report a tool count there; prefer list_mcp_tools().
+    """
+    try:
+        text = doctor_json.read_text()
+    except OSError as e:
+        raise ReaTeamError(f"Cannot read {doctor_json}: {e}", hint="Run `rea-team set-tools` with no options.") from e
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        hint = "Run `rea-team set-tools` with no options to ask `rea --mcp` directly."
+        if "Extra data" in str(e):
+            hint = "The file holds more than one JSON document (written with `>>`?). " + hint
+        raise ReaTeamError(f"Cannot parse {doctor_json}: {e}", hint=hint) from e
     names: set[str] = set()
 
     def walk(node, in_tools=False):
