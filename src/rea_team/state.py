@@ -1,47 +1,73 @@
-"""Checkpointed run state, saved after every step so a run can resume."""
+"""Checkpointed project state, saved after every step so any run can resume."""
 
 from __future__ import annotations
 
 import fcntl
 import json
 import os
-import secrets
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .errors import LockHeld, ReaTeamError
 
-STATUS_RUNNING = "running"
-STATUS_FAILED = "failed"
-STATUS_INTERRUPTED = "interrupted"
-STATUS_PASSED = "passed"
-STATUS_NO_PARITY = "no_parity"
+# feature statuses
+PENDING = "pending"
+RUNNING = "running"
+PASSED = "passed"
+FAILED = "failed"
+BLOCKED = "blocked"          # a dependency failed
+INTERRUPTED = "interrupted"
 
 
 @dataclass
-class RunState:
-    run_id: str
-    target: str
-    feature: str
-    authorized_at: str
-    status: str = STATUS_RUNNING
+class FeatureState:
+    id: str
+    status: str = PENDING
     round: int = 1
-    done: list[str] = field(default_factory=list)      # completed step keys
+    done: list[str] = field(default_factory=list)   # completed step keys
     hashes: dict[str, str] = field(default_factory=dict)
-    results: list[dict] = field(default_factory=list)  # one entry per verify round
+    results: list[dict] = field(default_factory=list)
+    gate: list[dict] = field(default_factory=list)  # one entry per gate run
+    commit: str = ""
     error: dict | None = None
-    started_at: float = field(default_factory=time.time)
+    started_at: float = 0
+    finished_at: float = 0
+
+    def is_done(self, key: str) -> bool:
+        return key in self.done
+
+    def reset(self, from_step: str | None = None) -> None:
+        if from_step is None:
+            self.__init__(self.id)  # type: ignore[misc]
+            return
+        if from_step not in self.done:
+            raise ReaTeamError(f"{from_step!r} is not a completed step of {self.id}. "
+                               f"Done: {', '.join(self.done) or 'nothing'}")
+        self.done = self.done[: self.done.index(from_step)]
+        if from_step.startswith("r") and "." in from_step:
+            self.round = int(from_step[1:].split(".")[0])
+            self.results = [r for r in self.results if r["round"] < self.round]
+        self.status = PENDING
+        self.error = None
+        self.commit = ""
+
+
+@dataclass
+class ProjectState:
+    authorized_at: str = ""
+    planned: list[str] = field(default_factory=list)   # completed plan steps
+    features: dict[str, FeatureState] = field(default_factory=dict)
     updated_at: float = field(default_factory=time.time)
 
-    # --- persistence -------------------------------------------------------
-
     @staticmethod
-    def new_id() -> str:
-        return time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(2)
+    def path(state_dir: Path) -> Path:
+        return state_dir / "project.json"
 
-    def path(self, state_dir: Path) -> Path:
-        return state_dir / "runs" / self.run_id / "state.json"
+    def feature(self, fid: str) -> FeatureState:
+        if fid not in self.features:
+            self.features[fid] = FeatureState(fid)
+        return self.features[fid]
 
     def save(self, state_dir: Path) -> None:
         self.updated_at = time.time()
@@ -52,32 +78,29 @@ class RunState:
         os.replace(tmp, p)  # atomic: a crash never leaves half a state file
 
     @classmethod
-    def load(cls, state_dir: Path, run_id: str) -> "RunState":
-        p = state_dir / "runs" / run_id / "state.json"
+    def load(cls, state_dir: Path) -> "ProjectState":
+        p = cls.path(state_dir)
         if not p.is_file():
-            known = ", ".join(list_runs(state_dir)) or "none"
-            raise ReaTeamError(f"No run {run_id!r}. Known runs: {known}")
+            return cls()
         try:
-            return cls(**json.loads(p.read_text()))
+            raw = json.loads(p.read_text())
+            feats = {k: FeatureState(**v) for k, v in raw.pop("features", {}).items()}
+            return cls(**raw, features=feats)
         except (json.JSONDecodeError, TypeError) as e:
-            raise ReaTeamError(f"State file {p} is corrupt: {e}") from e
+            raise ReaTeamError(f"State file {p} is corrupt: {e}",
+                               hint="Restore it from lab/.rea-team/project.json.bak, or delete it to start over.") from e
 
-    def is_done(self, key: str) -> bool:
-        return key in self.done
-
-    def mark_done(self, key: str, state_dir: Path) -> None:
-        if key not in self.done:
-            self.done.append(key)
-        self.save(state_dir)
-
-
-def list_runs(state_dir: Path) -> list[str]:
-    d = state_dir / "runs"
-    return sorted(p.name for p in d.iterdir() if (p / "state.json").is_file()) if d.is_dir() else []
+    def backup(self, state_dir: Path) -> None:
+        p = self.path(state_dir)
+        if p.is_file():
+            (state_dir / "project.json.bak").write_text(p.read_text())
 
 
 class WorkspaceLock:
-    """Exclusive lock so two runs never share lab/ and the container."""
+    """Exclusive lock so two runs never share lab/ and the container.
+
+    The OS releases it automatically if the process dies, so it never goes stale.
+    """
 
     def __init__(self, state_dir: Path):
         state_dir.mkdir(parents=True, exist_ok=True)

@@ -14,7 +14,7 @@ REQUIRED_SPEC_SECTIONS = [
     "Errors", "Test Cases", "Open questions",
 ]
 
-RESULT_RE = re.compile(r"^\s*RESULT\s+wrong=(\d+)\s+crash=(\d+)\s*$")
+RESULT_RE = re.compile(r"^\s*RESULT\s+wrong=(\d+)\s+crash=(\d+)(?:\s+spec_wrong=(\d+))?\s*$")
 GROUP_RE = re.compile(r"^\s*(\w[\w-]*)\s+(\d+)\s*/\s*(\d+)\s+([\d.]+)%\s*$")
 
 
@@ -40,10 +40,7 @@ def assert_no_leaks(spec: Path, patterns: list[str]) -> None:
 
 
 def missing_spec_sections(text: str) -> list[str]:
-    headings = {m.group(1).strip().lower()
-                for m in re.finditer(r"^#{1,4}\s+(.+?)\s*#*\s*$", text, re.MULTILINE)}
-    return [s for s in REQUIRED_SPEC_SECTIONS
-            if not any(h == s.lower() or h.endswith(s.lower()) or h.startswith(s.lower()) for h in headings)]
+    return missing_sections(text, REQUIRED_SPEC_SECTIONS)
 
 
 @dataclass
@@ -51,10 +48,11 @@ class VerifyResult:
     wrong: int
     crash: int
     groups: dict[str, dict]
+    spec_wrong: int = 0   # acceptance tests that fail on the ORIGINAL: the spec is wrong
 
     @property
     def passed(self) -> bool:
-        return self.wrong == 0 and self.crash == 0
+        return self.wrong == 0 and self.crash == 0 and self.spec_wrong == 0
 
 
 def parse_report(text: str) -> VerifyResult:
@@ -69,7 +67,7 @@ def parse_report(text: str) -> VerifyResult:
         g = GROUP_RE.match(l)
         if g:
             groups[g.group(1)] = {"pass": int(g.group(2)), "total": int(g.group(3)), "pct": float(g.group(4))}
-    return VerifyResult(int(m.group(1)), int(m.group(2)), groups)
+    return VerifyResult(int(m.group(1)), int(m.group(2)), groups, int(m.group(3) or 0))
 
 
 def hash_tree(root: Path) -> str:
@@ -89,3 +87,35 @@ def hash_tree(root: Path) -> str:
                 h.update(chunk)
         h.update(b"\0")
     return h.hexdigest()
+
+
+# --- feature pipeline checks -------------------------------------------------------
+
+REQUIRED_CONTRACT_SECTIONS = ["Conventions", "Data Model", "Public API"]
+
+
+def missing_sections(text: str, required: list[str]) -> list[str]:
+    headings = {m.group(1).strip().lower()
+                for m in re.finditer(r"^#{1,4}\s+(.+?)\s*#*\s*$", text, re.MULTILINE)}
+    return [s for s in required
+            if not any(h == s.lower() or h.endswith(s.lower()) or h.startswith(s.lower()) for h in headings)]
+
+
+def assert_append_only(old: str, new: str) -> None:
+    """CONTRACTS.md may grow, never change: earlier text must be a prefix of the new text."""
+    from .errors import ContractViolation
+    o, n = old.rstrip(), new.rstrip()
+    if not n.startswith(o):
+        # find the first differing line to show the user
+        ol, nl = o.splitlines(), n.splitlines()
+        for i, (a, b) in enumerate(zip(ol, nl), 1):
+            if a != b:
+                raise ContractViolation(f"CONTRACTS.md line {i} changed:\n  was: {a[:120]}\n  now: {b[:120]}")
+        raise ContractViolation("CONTRACTS.md lost text at its end (lines were removed)")
+
+
+def assert_spec_size(path: Path, limit: int) -> None:
+    from .errors import SpecTooLarge
+    n = len(path.read_text(errors="replace"))
+    if n > limit:
+        raise SpecTooLarge(f"{path.name} is {n:,} characters (limit {limit:,}); one session can't hold it well")

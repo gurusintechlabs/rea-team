@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rea-team"
-version = "0.1.0"
-description = "Clean-room reverse engineering team for Claude Code + REA, with checkpoints and resume"
+version = "0.2.0"
+description = "Feature-by-feature clean-room rebuilds of legacy software with Claude Code (+ REA), with regression gates and resume"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

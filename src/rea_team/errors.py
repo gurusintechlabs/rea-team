@@ -43,7 +43,7 @@ class AuthorizationError(ReaTeamError):
 
 class LockHeld(ReaTeamError):
     exit_code = 13
-    hint = "Another run is using this workspace. Wait for it, or remove the stale lock if it crashed."
+    hint = "Another rea-team run is using this workspace. Wait for it to finish (the lock frees itself if that process dies)."
 
 
 # --- execution -------------------------------------------------------------
@@ -97,3 +97,30 @@ class ReportFormatError(StepFailed):
 class ParityNotReached(ReaTeamError):
     exit_code = 2
     hint = "Read report.md and evidence.md unknowns: a gap that survives every round is usually missing evidence."
+
+
+# --- feature pipeline ----------------------------------------------------------
+
+class FeatureGraphError(ConfigError):
+    hint = "Fix features.toml: unique ids, known depends_on, no cycles (see USER_GUIDE, 'features.toml')."
+
+
+class SpecTooLarge(StepFailed):
+    hint = ("Split this feature into smaller features in features.toml (or raise "
+            "project.max_spec_chars), then `rea-team reset <id>` and run again.")
+
+
+class ContractViolation(IntegrityError):
+    """CONTRACTS.md may only grow: earlier text must stay exactly as it was."""
+    hint = ("CONTRACTS.md was rewritten instead of extended. Restore it from the archive in "
+            "lab/.rea-team/contracts/, then resume. Breaking contract changes need a deliberate re-plan.")
+
+
+class GateFailed(StepFailed):
+    """The test suite (unit + every feature's acceptance tests) still fails after fix attempts."""
+    hint = ("Read the gate log. A regression in an older feature means this feature broke it. "
+            "The clean room was rolled back to the last passing feature.")
+
+
+class NoAcceptanceTests(StepFailed):
+    hint = "The test-writer produced no acceptance tests. Check its log and the [project].stack setting."

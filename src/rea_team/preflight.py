@@ -8,6 +8,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import features
 from .config import Config
 from .container import CleanRoom
 from .errors import ReaTeamError
@@ -46,7 +47,7 @@ def node_ok(version: str) -> bool:
     return (major == 22 and minor >= 19) or (major == 24 and minor >= 11) or major >= 26
 
 
-def _agent_checks(cfg: Config) -> list[Check]:
+def _agent_checks(cfg: Config, needs_rea: bool = True) -> list[Check]:
     lab_agents = cfg.lab_dir / ".claude" / "agents"
     clean_agents = cfg.clean_dir / ".claude" / "agents"
     out: list[Check] = []
@@ -55,9 +56,12 @@ def _agent_checks(cfg: Config) -> list[Check]:
     if analyst is None:
         out.append(Check("analyst agent", False, f"missing {lab_agents / 'analyst.md'}"))
     elif any(PLACEHOLDER in t or "<" in t for t in analyst):
-        out.append(Check("analyst agent", False,
-                         "tools line still has a placeholder; run `rea-team set-tools` after `rea doctor --json`"))
-    elif not any(t.startswith(REA_PREFIX) for t in analyst):
+        if needs_rea:
+            out.append(Check("analyst agent", False,
+                             "tools line still has a placeholder; run `rea-team set-tools` after `rea doctor --json`"))
+        else:
+            out.append(Check("analyst agent", True, "no REA needed; the unused placeholder is removed at run time"))
+    elif needs_rea and not any(t.startswith(REA_PREFIX) for t in analyst):
         out.append(Check("analyst agent", False, f"no {REA_PREFIX}* tools; the analyst cannot read the target"))
     else:
         out.append(Check("analyst agent", True, f"{sum(t.startswith(REA_PREFIX) for t in analyst)} REA tools"))
@@ -70,18 +74,37 @@ def _agent_checks(cfg: Config) -> list[Check]:
             bad = [t for t in tools if any(t == f or t.startswith(f) for f in forbidden)]
             out.append(Check(f"{name} agent", not bad, f"must not have: {', '.join(bad)}" if bad else ""))
 
-    rb = agent_tools(clean_agents / "rebuilder.md")
-    if rb is None:
-        out.append(Check("rebuilder agent", False, f"missing {clean_agents / 'rebuilder.md'}"))
-    else:
-        bad = [t for t in rb if t.startswith(REA_PREFIX)]
-        out.append(Check("rebuilder agent", not bad, f"REA tools in clean room: {bad}" if bad else ""))
+    for name in ("test-writer", "rebuilder"):
+        tools = agent_tools(clean_agents / f"{name}.md")
+        if tools is None:
+            out.append(Check(f"{name} agent", False, f"missing {clean_agents / (name + '.md')}"))
+        else:
+            bad = [t for t in tools if t.startswith(REA_PREFIX)]
+            out.append(Check(f"{name} agent", not bad, f"REA tools in clean room: {bad}" if bad else ""))
     return out
 
 
-def run_checks(cfg: Config, runner: Runner, *, target: str | None = None,
-               include_container: bool = True) -> list[Check]:
+def run_checks(cfg: Config, runner: Runner, *, targets: list[str] | None = None,
+               check_features: bool = False, include_container: bool = True,
+               needs_rea: bool | None = None) -> list[Check]:
     checks: list[Check] = []
+    forced = needs_rea
+    needs_rea = True if needs_rea is None else needs_rea
+
+    if check_features:
+        try:
+            feats = features.load(cfg.features_file, default_mode=cfg.default_mode)
+            if forced is None:
+                needs_rea = any(f.mode == "rea" for f in feats)
+            checks.append(Check("features.toml", True, f"{len(feats)} features, dependency order OK"))
+            targets = sorted({*(targets or []), *(f.target for f in feats)})
+            if any(f.mode == "decompiled" for f in feats) and not cfg.decompile_command:
+                checks.append(Check("decompiler", False, "a feature uses mode=decompiled but "
+                                                         "analysis.decompile_command is empty"))
+        except ReaTeamError as e:
+            checks.append(Check("features.toml", False, str(e)))
+        has_contracts = (cfg.lab_dir / "handoff" / "CONTRACTS.md").is_file()
+        checks.append(Check("CONTRACTS.md", has_contracts, "" if has_contracts else "run `rea-team plan` first"))
 
     def tool(name: str, cmd: list[str], validate=None):
         if not shutil.which(cmd[0]):
@@ -101,27 +124,31 @@ def run_checks(cfg: Config, runner: Runner, *, target: str | None = None,
         else:
             checks.append(Check(name, True, first))
 
-    tool("node", ["node", "-v"], node_ok)
     tool("claude", [cfg.claude_command, "--version"])
-    tool("rea", ["rea", "--version"])
+    if needs_rea:
+        tool("node", ["node", "-v"], node_ok)
+        tool("rea", ["rea", "--version"])
     tool("docker", ["docker", "--version"])
 
-    checks += _agent_checks(cfg)
+    checks += _agent_checks(cfg, needs_rea)
 
-    if target is not None:
+    for target in targets or []:
         t = (cfg.lab_dir / target).resolve()
         if not t.is_relative_to(cfg.lab_dir):
-            checks.append(Check("target", False, "target must live inside lab/"))
+            checks.append(Check(f"target {target}", False, "targets must live inside lab/"))
         else:
-            checks.append(Check("target", t.exists(), str(t) if t.exists() else f"not found: {t}"))
+            checks.append(Check(f"target {target}", t.exists(), "" if t.exists() else f"not found: {t}"))
 
     if include_container:
         room = CleanRoom(cfg, runner)
         try:
             room.ensure_running()
             checks.append(Check("clean container", True, cfg.container_name))
-            room.check_claude()
-            checks.append(Check("claude in container", True))
+            claude_ok = room.check_tool(cfg.container_claude_command, "--version")
+            checks.append(Check("claude in container", claude_ok,
+                                "" if claude_ok else "install Claude Code in the image and sign it in"))
+            git_ok = room.check_tool("git", "--version")
+            checks.append(Check("git in container", git_ok, "" if git_ok else "install git in the image"))
             breaches = room.check_wall()
             checks.append(Check("clean-room wall", not breaches, "; ".join(breaches) or "rea, npm and lab unreachable"))
         except ReaTeamError as e:
@@ -165,3 +192,22 @@ def set_analyst_tools(cfg: Config, tools: list[str]) -> Path:
         raise ReaTeamError(f"No tools: line in {path}")
     path.write_text(text)
     return path
+
+
+def strip_rea_placeholder(cfg: Config) -> bool:
+    """For projects that never use REA: drop the unfilled placeholder from the analyst's tools."""
+    path = cfg.lab_dir / ".claude" / "agents" / "analyst.md"
+    if not path.is_file():
+        return False
+    text = path.read_text()
+    if PLACEHOLDER not in text:
+        return False
+    path.write_text(text.replace(", " + PLACEHOLDER, "").replace(PLACEHOLDER, ""))
+    return True
+
+
+def project_needs_rea(cfg: Config) -> bool:
+    try:
+        return any(f.mode == "rea" for f in features.load(cfg.features_file, default_mode=cfg.default_mode))
+    except ReaTeamError:
+        return cfg.default_mode == "rea"
