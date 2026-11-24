@@ -70,14 +70,26 @@ def parse_report(text: str) -> VerifyResult:
     return VerifyResult(int(m.group(1)), int(m.group(2)), groups, int(m.group(3) or 0))
 
 
-def hash_tree(root: Path) -> str:
-    """Stable hash of a file or directory (paths + contents)."""
+# Folders that installing, building or testing creates. Ignored when checking that
+# an agent did not edit the rebuild, because running it legitimately creates them.
+GENERATED_DIRS = frozenset({
+    "node_modules", "test-results", "playwright-report", "blob-report", "coverage", "dist", "build",
+    ".venv", "venv", "__pycache__", ".pytest_cache", ".gradle", "target", ".next", ".cache", ".turbo",
+})
+
+
+def hash_tree(root: Path, exclude: frozenset[str] = frozenset()) -> str:
+    """Stable hash of a file or directory (paths + contents), skipping `exclude` folder names."""
     h = hashlib.sha256()
+    if not root.exists():
+        return ""
     if root.is_file():
         files = [root]
         base = root.parent
     else:
-        files = sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink())
+        files = sorted(p for p in root.rglob("*")
+                       if p.is_file() and not p.is_symlink()
+                       and not (exclude and exclude.intersection(p.relative_to(root).parts[:-1])))
         base = root
     for p in files:
         h.update(str(p.relative_to(base)).encode())

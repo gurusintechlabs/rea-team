@@ -70,9 +70,10 @@ def _print_checks(checks) -> bool:
 
 def cmd_doctor(args) -> int:
     cfg = config.load()
-    has_features = cfg.features_file.is_file() and "[[feature]]" in cfg.features_file.read_text()
+    has_features = featmod.has_entries(cfg.features_file)
     checks = preflight.run_checks(cfg, Runner(cfg.state_dir / "logs" / "doctor"), targets=args.target or None,
-                                  check_features=has_features)
+                                  check_features=has_features,
+                                  needs_rea=None if has_features else cfg.default_mode == "rea")
     ok = _print_checks(checks)
     print("\nAll checks passed." if ok else "\nFix the ✗ items above before running.")
     return 0 if ok else PreflightError.exit_code
@@ -151,7 +152,7 @@ def cmd_plan(args) -> int:
         deps = f"  ← {', '.join(f.depends_on)}" if f.depends_on else ""
         print(f"  {f.id:<28} {f.title}{deps}")
     if args.accept:
-        if cfg.features_file.is_file() and "[[feature]]" in cfg.features_file.read_text() and not args.force:
+        if featmod.has_entries(cfg.features_file) and not args.force:
             raise ReaTeamError("features.toml already has features; pass --force to overwrite it")
         cfg.features_file.write_text(proposed.read_text())
         print(f"\nSaved as {cfg.features_file.name}.")

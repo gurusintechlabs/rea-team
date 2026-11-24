@@ -391,7 +391,10 @@ class Project:
         report = self.lab / "analysis" / "features" / f.id / "report.md"
         report.unlink(missing_ok=True)
         spec = self._spec_path(f)
-        rebuild_before = checks.hash_tree(rebuild)
+        def rebuild_hash() -> str:  # only what came from the clean room; ignore generated folders
+            return "".join(checks.hash_tree(rebuild / d, checks.GENERATED_DIRS) for d in ("src", "tests"))
+
+        rebuild_before = rebuild_hash()
         spec_before = checks.hash_tree(spec)
 
         def attempt():
@@ -408,7 +411,7 @@ class Project:
                 raise TransientError(str(e)) from e
 
         result = self._retry("verifier", attempt)
-        if checks.hash_tree(rebuild) != rebuild_before:
+        if rebuild_hash() != rebuild_before:
             raise IntegrityError("The verifier modified lab/rebuild/. It must only report.")
         if checks.hash_tree(spec) != spec_before:
             raise IntegrityError("The verifier modified the feature spec. It must only report.")

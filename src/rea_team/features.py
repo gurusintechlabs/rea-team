@@ -136,3 +136,8 @@ def dependents(feats: list[Feature], fid: str) -> set[str]:
                 out.add(f.id)
                 changed = True
     return out
+
+
+def has_entries(path: Path) -> bool:
+    """True if the file defines at least one real (uncommented) [[feature]]."""
+    return path.is_file() and re.search(r"^\s*\[\[feature\]\]", path.read_text(), re.MULTILINE) is not None

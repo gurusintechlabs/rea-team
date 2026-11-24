@@ -4,6 +4,8 @@ rea-team rebuilds legacy software **one feature at a time** with Claude Code. A 
 
 The guide is written for rebuilding **your own** legacy products: desktop apps, web apps and Jira plugins.
 
+**New here?** Read section 1, then follow the [end-to-end walkthrough](#21-end-to-end-walkthrough-a-sample-web-app) in section 21, which rebuilds a sample web app step by step.
+
 ---
 
 ## Contents
@@ -28,6 +30,7 @@ The guide is written for rebuilding **your own** legacy products: desktop apps, 
 18. [Command reference](#18-command-reference)
 19. [FAQ](#19-faq)
 20. [Limits](#20-limits)
+21. [End-to-end walkthrough: a sample web app](#21-end-to-end-walkthrough-a-sample-web-app)
 
 ---
 
@@ -166,6 +169,8 @@ Never mount `lab/`, your home folder or `~/.claude.json`. Mounting only `clean/`
 
 1. **Preinstall, then lock down (simplest).** Install every dependency at image build time, then apply an outbound allowlist (Claude Code's reference devcontainer firewall script is a good base) without the npm registry. This works when the stack is known up front.
 2. **Filtered registry (most flexible).** Run a local npm proxy such as Verdaccio that serves normal packages but blocks `rea-agents`, and point the container's npm at it. The rebuilder can add libraries as it goes, and the wall check still passes because `npm view rea-agents` fails.
+
+**Where things run.** The rebuilder, the test-writer and the **test gate** run inside this container, so gate tests must be self-contained: a database in the container (or in memory), and fakes for email, payment and other external services. The **verifier** runs in the lab on your Mac. It starts the original wherever it lives (locally, or a staging server over your VPN) and starts the rebuild either on your Mac or, better, in a throwaway container from this same image. Describe that in `[verify].rebuild` (section 21.3 has an example). Only the verifier needs your internal network. The clean room never does.
 
 **Verify:**
 
@@ -533,3 +538,446 @@ Suggested reading order when a feature fails: `status <id>`, then the newest `ga
 - UI-heavy desktop behavior is harder to test automatically than web or CLI behavior. Design specs around observable outputs.
 - The wall check catches common breaches. It doesn't replace building the container correctly.
 - Use test environments and test accounts for the original's runtime. Never production.
+
+---
+
+## 21. End-to-end walkthrough: a sample web app
+
+This walkthrough rebuilds a small legacy web app from start to finish. Every command, file and output is shown in the shape you'll actually see. Swap in your own app as you go.
+
+### 21.1 The sample app
+
+**Notely** is a legacy notes app you own: Node 14, Express, EJS server-rendered pages, jQuery, SQLite. Its source is in `~/code/notely`. Users sign in, create notes, edit them, search them and share a read-only link. The target is a modern TypeScript rebuild with the same behavior.
+
+Where things run (see "Where things run" in section 5):
+
+| What | Where | Address |
+|---|---|---|
+| Original Notely | your Mac | `http://localhost:4000` |
+| Rebuild during the **test gate** | clean container | `http://localhost:3000` inside the container |
+| Rebuild during **verification** | a throwaway container started by the verifier | `http://localhost:3001` on your Mac |
+
+Nothing needs your company network. Everything is local.
+
+### 21.2 Create the workspace
+
+```bash
+rea-team init notely-rebuild && cd notely-rebuild
+cp -R ~/code/notely lab/target/notely
+```
+
+Make sure the original runs, because the verifier will need it:
+
+```bash
+cd lab/target/notely && npm ci && PORT=4000 DATABASE_FILE=/tmp/notely-legacy.db npm start
+# open http://localhost:4000, sign in with the seeded user demo@notely.test / demo1234, then Ctrl-C
+cd ../../..
+```
+
+### 21.3 Configure
+
+Edit `rea-team.toml`:
+
+```toml
+[project]
+name = "notely"
+stack = """TypeScript on Node 22. Express 5 + server-rendered HTML (no SPA framework).
+SQLite via better-sqlite3; the database file path comes from env DATABASE_FILE.
+Port from env PORT. GET /health returns 200 when ready.
+Unit tests: Vitest, in src/. Functional tests: Playwright (@playwright/test), TypeScript,
+in tests/acceptance/<feature>/, base URL from env APP_URL, stable selectors
+(getByRole / getByLabel), explicit waits, each test creates its own user and data."""
+test_command = "sh run-tests.sh"
+max_spec_chars = 60000
+fix_attempts = 3
+keep_going = false
+
+[analysis]
+default_mode = "source"        # we have Notely's source code; no REA needed
+
+[verify]
+original = """Original: in lab/target/notely run `npm ci` once, then
+`PORT=4000 DATABASE_FILE=$(mktemp) npm start` in the background; it is ready when
+http://localhost:4000/login returns 200. Seeded user: demo@notely.test / demo1234.
+Stop it when you are done."""
+rebuild = """Rebuild: start it in a throwaway container so nothing runs on the Mac directly:
+docker run --rm -d --name notely-verify -p 3001:3000 -e PORT=3000 -e DATABASE_FILE=/tmp/v.db
+  -v "$PWD/rebuild/src:/app" -w /app rea-clean-img sh -c "npm ci && npm start"
+Ready when http://localhost:3001/health returns 200. Stop with `docker rm -f notely-verify`.
+Run acceptance tests with APP_URL=http://localhost:3001 (rebuild) or APP_URL=http://localhost:4000 (original),
+from lab/rebuild with `npx playwright test tests/acceptance/<id>`."""
+```
+
+The verifier runs Playwright from your Mac against both apps, so install it once next to where the tests get copied (`lab/rebuild/` survives between rounds; only its `src/` and `tests/` are replaced):
+
+```bash
+mkdir -p lab/rebuild && cd lab/rebuild && npm init -y >/dev/null && npm i -D @playwright/test && npx playwright install chromium && cd ../..
+```
+
+Folders that running things creates, like `node_modules/` and `test-results/`, are ignored by the check that the verifier didn't modify the rebuild. Edits to the rebuild's source or tests still stop the run.
+
+### 21.4 The clean room
+
+**Image.** `docs/clean-room/Dockerfile.example` already installs Node 22, git, curl, Claude Code and Playwright with Chromium. Add the SQLite build tools:
+
+```dockerfile
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
+```
+
+```bash
+docker build -t rea-clean-img -f docs/clean-room/Dockerfile.example .
+```
+
+**Shared test tooling.** Create `clean/package.json`, so the acceptance tests have Playwright no matter what the rebuilder does in `src/`:
+
+```json
+{ "private": true, "devDependencies": { "@playwright/test": "^1.50.0" } }
+```
+
+**The regression gate script.** Create `clean/run-tests.sh`. The gate runs it from `/work` on every build:
+
+```sh
+#!/bin/sh
+# Regression gate: unit tests + EVERY feature's acceptance tests. Exit 0 only if all pass.
+set -e
+cd /work/src
+npm ci --silent
+npm test                                   # Vitest unit tests
+
+export DATABASE_FILE="$(mktemp)"           # fresh database every gate run
+PORT=3000 npm start > /tmp/notely.log 2>&1 &
+APP=$!
+trap 'kill $APP 2>/dev/null; true' EXIT
+for i in $(seq 1 30); do curl -sf http://localhost:3000/health >/dev/null && break; sleep 1; done
+curl -sf http://localhost:3000/health >/dev/null || { echo "app did not start:"; cat /tmp/notely.log; exit 1; }
+
+cd /work
+APP_URL=http://localhost:3000 npx playwright test tests/acceptance --reporter=line
+```
+
+**Start the container**, install the shared tooling while npm is still reachable, then turn on the firewall (or point npm at your filtered proxy, section 5):
+
+```bash
+docker run -d --name rea-clean --cap-add=NET_ADMIN --cap-add=NET_RAW \
+  -v "$PWD/clean:/work" -w /work -e ANTHROPIC_API_KEY rea-clean-img sleep infinity
+docker exec rea-clean npm install          # @playwright/test into /work/node_modules
+docker exec rea-clean sudo /usr/local/bin/init-firewall.sh   # your allowlist, without registry.npmjs.org
+```
+
+With a filtered npm proxy instead of a hard firewall, the rebuilder can `npm install express` as it goes. With the hard firewall, preinstall the libraries you expect it to use in the image.
+
+**Check it:**
+
+```bash
+rea-team doctor
+```
+
+```
+  ✓ claude               2.x (Claude Code)
+  ✓ docker               Docker version 27.x
+  ✓ analyst agent        no REA needed; the unused placeholder is removed at run time
+  ✓ spec-writer agent
+  ✓ verifier agent
+  ✓ test-writer agent
+  ✓ rebuilder agent
+  ✓ clean container      rea-clean
+  ✓ claude in container
+  ✓ git in container
+  ✓ clean-room wall      rea, npm and lab unreachable
+
+All checks passed.
+```
+
+### 21.5 Plan
+
+```bash
+rea-team plan target/notely --mode source --authorized
+```
+
+```
+09:00:53 no feature uses REA: removed the unused REA placeholder from the analyst's tools
+09:00:53 → plan.survey
+09:14:20 → plan.contracts
+09:21:02 ✓ plan done. Review features.proposed.toml and handoff/CONTRACTS.md, then save the list as features.toml
+
+Proposed 6 features (build order):
+  sign-in                      Sign in and out
+  create-note                  Create a note                 ← sign-in
+  edit-note                    Edit and delete a note        ← create-note
+  list-notes                   List notes, newest first      ← create-note
+  search-notes                 Search notes                  ← list-notes
+  share-note                   Share a read-only link        ← create-note
+```
+
+**Review `features.proposed.toml`.** Here the survey lumped sign-up into `sign-in`. Split it, because sign-up has its own validation rules and emails:
+
+```toml
+[[feature]]
+id = "sign-up"
+title = "Create an account"
+scope = "A visitor creates an account with email and password and is signed in."
+target = "target/notely"
+mode = "source"
+
+[[feature]]
+id = "sign-in"
+title = "Sign in and out"
+scope = "A user with an account signs in with email and password, and signs out."
+target = "target/notely"
+mode = "source"
+depends_on = ["sign-up"]
+
+[[feature]]
+id = "create-note"
+title = "Create a note"
+scope = "A signed-in user creates a note with a title and a body and sees it saved."
+target = "target/notely"
+mode = "source"
+depends_on = ["sign-in"]
+notes = "Legacy trims titles and limits them to 120 characters; check routes/notes.js."
+# ... edit-note, list-notes, search-notes, share-note as proposed
+```
+
+Save it as `features.toml`.
+
+**Review `lab/handoff/CONTRACTS.md`.** An excerpt of what you should see, and what to fix:
+
+```markdown
+# Notely contracts
+
+## Conventions
+- All pages are server-rendered HTML. Forms POST and redirect (303) on success.
+- Validation errors re-render the form with HTTP 422 and a message in an element with role="alert".
+- IDs are opaque strings. Timestamps are ISO-8601 UTC.
+- GET /health returns 200 "ok" when the app is ready.
+- Sessions: cookie "sid", HttpOnly, expires after 14 days of inactivity.
+
+## Data Model
+- User: id, email (unique, case-insensitive), password (hashed; never returned), created_at
+- Note: id, owner (User.id), title (1–120 chars, trimmed), body (0–20000 chars), created_at, updated_at
+
+## Public API
+- GET  /login, POST /login, POST /logout
+- GET  /notes, GET /notes/new, POST /notes, GET /notes/:id
+```
+
+Check that the names are the ones you want going forward. If the legacy app called notes `memos` internally, the contracts are where you say `Note` for good. They're append-only once features build on them.
+
+### 21.6 Build the first feature only
+
+Start small. Check the quality of the spec, tests and code before letting it run through everything.
+
+```bash
+rea-team run --feature sign-up
+```
+
+```
+09:30:01 ━━ feature sign-up: Create an account
+09:30:01   → analyst
+09:41:37   ✓ analyst (696s)
+09:41:37   → spec
+09:47:12   ✓ spec (335s)
+09:47:12   → r1.leak
+09:47:12   ✓ r1.leak (0s)
+09:47:12   → r1.handoff
+09:47:14   ✓ r1.handoff (2s)
+09:47:14   → r1.wall
+09:47:20   ✓ r1.wall (6s)
+09:47:20   → r1.tests
+09:55:03   ✓ r1.tests (463s)
+09:55:03   → r1.build
+10:19:48     gate passed (unit + all acceptance tests)
+10:19:48   ✓ r1.build (1485s)
+10:19:48   → r1.verify
+10:34:10     verify: wrong=0 crash=0 spec_wrong=0
+10:34:10   ✓ r1.verify (862s)
+10:34:10   → commit
+10:34:11   ✓ commit (1s)
+10:34:11 ━━ sign-up PASSED (commit 3e1a9c2)
+
+notely: features in build order
+  ✓ sign-up                      passed      round 1: wrong=0 crash=0  commit 3e1a9c2
+  · sign-in                      pending
+  ...
+```
+
+(Timings are illustrative. Real ones depend on the app and the model.)
+
+**Inspect what was produced:**
+
+`lab/handoff/features/sign-up.md` (excerpt):
+
+```markdown
+# Feature: sign-up
+
+## Architecture
+Adds GET /signup and POST /signup. Uses User from CONTRACTS.md. On success the user is signed in
+(session cookie per Conventions) and redirected to /notes.
+
+## Errors
+- Email already registered (any letter case) → 422, alert "An account with this email already exists."
+- Password shorter than 8 characters → 422, alert "Password must be at least 8 characters."
+- Invalid email → 422, alert "Enter a valid email address."
+
+## Test Cases
+- TC-1 New email + valid password → 303 to /notes; the page shows the email in the header.
+- TC-2 Same email in different case (Ana@x.test after ana@x.test) → 422 with the duplicate message.
+- TC-3 Password "short" → 422 with the length message; the email field keeps its value.
+- TC-4 Email "not-an-email" → 422 with the email message.
+
+## Open questions
+- The legacy code sends a welcome email through a provider that isn't in the shipped source. Not tested.
+```
+
+`clean/tests/acceptance/sign-up/sign-up.spec.ts`, written by the test-writer from the spec only:
+
+```ts
+// Open questions not tested: welcome email.
+import { test, expect } from "@playwright/test";
+
+const base = process.env.APP_URL!;
+const unique = () => `u${Date.now()}${Math.floor(Math.random() * 1e6)}@notely.test`;
+
+test("TC-1 new account lands on notes, signed in", async ({ page }) => {
+  const email = unique();
+  await page.goto(`${base}/signup`);
+  await page.getByLabel("Email").fill(email);
+  await page.getByLabel("Password").fill("correct-horse");
+  await page.getByRole("button", { name: /sign up/i }).click();
+  await expect(page).toHaveURL(/\/notes$/);
+  await expect(page.getByText(email)).toBeVisible();
+});
+
+test("TC-2 duplicate email is rejected regardless of case", async ({ page }) => {
+  const email = unique();
+  for (const e of [email, email.toUpperCase()]) {
+    await page.goto(`${base}/signup`);
+    await page.getByLabel("Email").fill(e);
+    await page.getByLabel("Password").fill("correct-horse");
+    await page.getByRole("button", { name: /sign up/i }).click();
+    if (e !== email) {
+      await expect(page.getByRole("alert")).toHaveText("An account with this email already exists.");
+    } else {
+      await page.getByRole("button", { name: /sign out/i }).click();
+    }
+  }
+});
+// TC-3, TC-4 ...
+```
+
+Because these tests only use `APP_URL` and what a user sees, the verifier runs the very same file against the original at `localhost:4000`. If TC-2 failed there, the legacy app doesn't actually ignore case: that's a `spec_wrong`, and the next round fixes the spec.
+
+`clean/BUILD_STATE.md`, the next session's memory:
+
+```markdown
+# Build state
+## Features done
+- sign-up: GET/POST /signup, signs the user in, redirects to /notes
+## How to run
+cd src && npm ci && PORT=3000 DATABASE_FILE=/tmp/dev.db npm start · tests: sh /work/run-tests.sh
+## Code map
+src/server.ts (app + routes mount) · src/db.ts (better-sqlite3, migrations in src/migrations/)
+src/auth/ (signup, session middleware) · src/views/ (HTML templates)
+## Interfaces
+requireUser(req) → User | redirect to /login · db.users.findByEmail(email) (case-insensitive)
+## Decisions
+Passwords: argon2id. Sessions stored in SQLite table sessions. Email normalized to lowercase on write.
+## Disputed tests and known gaps
+none
+```
+
+`lab/analysis/features/sign-up/report.md` (excerpt):
+
+```
+ordinary    24 / 24   100%
+edge        12 / 12   100%
+malformed    9 /  9   100%
+acceptance on original   4 / 4
+RESULT wrong=0 crash=0 spec_wrong=0
+```
+
+The code is in `clean/src` on your Mac:
+
+```bash
+cd clean && git log --oneline
+3e1a9c2 feature sign-up: Create an account
+a01b2c3 rea-team: clean room baseline
+```
+
+### 21.7 Run the rest
+
+Happy with the first feature? Let it run through everything:
+
+```bash
+rea-team run
+```
+
+It continues with `sign-in`, `create-note` and the rest, in dependency order, each in fresh sessions. You can watch from another terminal with `rea-team status`.
+
+### 21.8 What a regression looks like
+
+Say that while building `search-notes`, the rebuilder changes how notes are stored and breaks `list-notes`' ordering. The gate catches it:
+
+```
+13:02:44   → r1.build
+13:31:10     gate failed (exit 1), fix session 1/3
+13:44:52     gate passed (unit + all acceptance tests)
+13:44:52   ✓ r1.build (2528s)
+```
+
+The first gate output is saved in `lab/.rea-team/features/search-notes/round-1/gate-0.txt`:
+
+```
+  ✘ [chromium] › list-notes/list-notes.spec.ts › TC-2 notes are listed newest first
+    Expected: "Third", "Second", "First"   Received: "First", "Second", "Third"
+  1 failed, 31 passed
+```
+
+The fix session got those lines, fixed the ordering without touching any test, and the whole suite passed. If it hadn't passed after 3 fix sessions, rea-team would have stopped with `GateFailed` and rolled `clean/` back to the `list-notes` commit, and `search-notes` would start fresh on the next `rea-team run`.
+
+### 21.9 What a divergence looks like
+
+The verifier finds that searching for `café` matches `cafe` in the original but not in the rebuild:
+
+```
+13:59:31     verify: wrong=1 crash=0 spec_wrong=0
+13:59:31   ✓ r1.verify (881s)
+13:59:31   → r1.spec_update
+14:03:02   ✓ r1.spec_update (211s)
+14:03:02   → r2.leak
+...
+14:21:40   → r2.tests                       ← the test-writer adds a test for the new case
+14:33:15   → r2.build                       ← the rebuilder makes it pass
+14:58:02     verify: wrong=0 crash=0 spec_wrong=0
+14:58:03 ━━ search-notes PASSED (commit 7d0e4f1)
+```
+
+The spec gained a case, written as behavior:
+
+```markdown
+- TC-7 Search is accent-insensitive: a note titled "Café plans" is found by "cafe" and by "café".
+```
+
+### 21.10 Finish
+
+```bash
+rea-team status
+```
+
+```
+plan: survey, contracts  (authorized 2026-11-24T09:00:41)
+
+notely: features in build order
+  ✓ sign-up                      passed      round 1: wrong=0 crash=0  commit 3e1a9c2
+  ✓ sign-in                      passed      round 1: wrong=0 crash=0  commit 51aa0b9
+  ✓ create-note                  passed      round 1: wrong=0 crash=0  commit 8c3d2e1
+  ✓ edit-note                    passed      round 1: wrong=0 crash=0  commit 0f9b7a4
+  ✓ list-notes                   passed      round 1: wrong=0 crash=0  commit c4e81d0
+  ✓ search-notes                 passed      round 2: wrong=0 crash=0  commit 7d0e4f1
+  ✓ share-note                   passed      round 1: wrong=0 crash=0  commit e2b6c93
+  7 passed
+```
+
+The rebuild is a normal git repo in `clean/`, with one commit per feature, a full acceptance suite in `clean/tests/acceptance/` and `BUILD_STATE.md` describing the code. Copy it into your own repository, add CI that runs `sh run-tests.sh`, and keep the acceptance suite as the regression net for future changes.
+
+**Before you ship, read** each feature's `QUESTIONS.md` (in `lab/.rea-team/features/<id>/round-N/`) and every spec's **Open questions**. They list the behavior nobody could prove from the legacy app, like the welcome email in `sign-up`. Those are decisions for you, not for the agents.

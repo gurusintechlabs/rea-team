@@ -152,3 +152,21 @@ def test_set_tools(tmp_path, monkeypatch):
     assert main(["set-tools", "--from-doctor", str(doc)]) == 0
     tools = agent_tools(tmp_path / "w/lab/.claude/agents/analyst.md")
     assert "mcp__rea__open_binary" in tools and "Read" in tools
+
+
+def test_commented_example_is_not_a_feature(tmp_path):
+    p = tmp_path / "features.toml"
+    p.write_text(featmod.EXAMPLE)
+    assert not featmod.has_entries(p)
+    p.write_text(F.format(id="a", deps="[]"))
+    assert featmod.has_entries(p)
+
+
+def test_doctor_before_plan_in_source_mode(tmp_path, monkeypatch, capsys):
+    main(["init", str(tmp_path / "w")])
+    monkeypatch.chdir(tmp_path / "w")
+    toml = tmp_path / "w/rea-team.toml"
+    toml.write_text(toml.read_text().replace('default_mode = "rea"', 'default_mode = "source"'))
+    main(["doctor"])
+    out = capsys.readouterr().out
+    assert "features.toml" not in out and "placeholder;" not in out

@@ -58,7 +58,7 @@ def test_full_workflow(env):
     r = cli("plan", "target/app", "--mode", "source", check=False)
     assert r.returncode == 12
 
-    r = cli("plan", "target/app", "--mode", "source", "--authorized", "--accept", "--force")
+    r = cli("plan", "target/app", "--mode", "source", "--authorized", "--accept")  # no --force needed
     assert "create-site" in r.stdout and "Saved as features.toml" in r.stdout
 
     r = cli("doctor")

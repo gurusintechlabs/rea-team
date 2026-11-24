@@ -40,4 +40,4 @@ rea-team status
 pip install -e '.[dev]' && pytest
 ```
 
-The 44 tests include a fake clean room that runs real shell, git and a real regression gate. They cover multi-feature builds, regressions caught and fixed, rollback, `keep_going`, rounds to parity, retries, leaks, contract rewrites, tampered tests, wall breaches, oversized specs, decompiled mode, and CLI subprocess runs with SIGTERM and resume.
+The 48 tests include a fake clean room that runs real shell, git and a real regression gate. They cover multi-feature builds, regressions caught and fixed, rollback, `keep_going`, rounds to parity, retries, leaks, contract rewrites, tampered tests, wall breaches, oversized specs, decompiled mode, and CLI subprocess runs with SIGTERM and resume.

@@ -276,3 +276,35 @@ def test_interrupted_feature_leftovers_not_committed_by_another(ws, tmp_path):
     assert "add-page" not in subprocess.run(["git", "show", "--stat", "rea/publish"], cwd=w.work,
                                             capture_output=True, text=True).stdout
     assert p.state.features["add-page"].done == ["analyst", "spec"]
+
+
+def test_verifier_running_the_rebuild_is_not_tampering(ws, tmp_path, monkeypatch):
+    """npm ci / playwright create node_modules and test-results: allowed. Editing source: not."""
+    w = world(ws, tmp_path)
+    p = plan_and_accept(ws, w)
+    orig = w._lab_agent
+
+    def verifier_that_runs_things(prompt):
+        orig(prompt)
+        if "verifier agent" in prompt:
+            nm = ws.lab_dir / "rebuild/src/node_modules/pkg"
+            nm.mkdir(parents=True, exist_ok=True)
+            (nm / "index.js").write_text("x")
+            (ws.lab_dir / "rebuild/test-results").mkdir(exist_ok=True)
+            (ws.lab_dir / "rebuild/test-results/run.json").write_text("{}")
+    monkeypatch.setattr(w, "_lab_agent", verifier_that_runs_things)
+    assert p.run(featmod.load(ws.features_file))["create-site"] == "passed"
+
+
+def test_verifier_editing_rebuild_source_is_caught(ws, tmp_path, monkeypatch):
+    w = world(ws, tmp_path)
+    p = plan_and_accept(ws, w)
+    orig = w._lab_agent
+
+    def evil(prompt):
+        orig(prompt)
+        if "verifier agent" in prompt:
+            (ws.lab_dir / "rebuild/src/create-site.txt").write_text("patched by verifier")
+    monkeypatch.setattr(w, "_lab_agent", evil)
+    with pytest.raises(IntegrityError, match="verifier"):
+        p.run(featmod.load(ws.features_file))
