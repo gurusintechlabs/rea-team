@@ -228,9 +228,10 @@ decompile_command = "java -jar /opt/vineflower.jar {input} {output}"
 **REA mode** needs the analyst's tool list filled in:
 
 ```bash
-cd lab && rea doctor --json > analysis/doctor.json && cd ..
-rea-team set-tools --from-doctor lab/analysis/doctor.json     # or --tools open_binary,analyze_javascript_application,...
+rea-team set-tools     # starts `rea --mcp`, asks for its tool list, writes every tool into the analyst
 ```
+
+Other sources: `--from-mcp "path/to/rea --mcp"` for a different REA install, or `--tools open_binary,analyze_javascript_application,...` for a hand-picked list. `--from-doctor FILE` still reads a `rea doctor --json` file, but REA 6.x only reports a tool count there, so it usually finds nothing. The analyst also needs an MCP server named `rea` registered in Claude Code (`claude mcp list` from `lab/`; `rea setup --client claude_code` if it is missing).
 
 If no feature uses REA, rea-team skips the REA and Node checks and removes the unused placeholder from the analyst's tools line by itself.
 
@@ -506,7 +507,7 @@ Suggested reading order when a feature fails: `status <id>`, then the newest `ga
 |---|---|
 | `rea-team init [dir] [--force]` | creates the workspace, agent files, config and example features.toml |
 | `rea-team doctor [--target T]` | checks every prerequisite: tools, agents, features, contracts, container, wall |
-| `rea-team set-tools --from-doctor F \| --tools a,b` | fills in the analyst's REA tools |
+| `rea-team set-tools [--from-mcp CMD \| --from-doctor F \| --tools a,b]` | fills in the analyst's REA tools |
 | `rea-team plan T... [--mode M] [--accept [--force]] [--redo] [--authorized]` | survey, proposed features and contracts |
 | `rea-team run [--feature ID]... [--keep-going] [--extra-rounds N] [--authorized] [--skip-preflight]` | builds features, continuing from checkpoints (`resume` is an alias) |
 | `rea-team reset ID [--from-step KEY]` | forgets progress so a feature runs again |

@@ -1,12 +1,15 @@
 """Pure functions: features graph, checks, retries, config, state."""
 
+import sys
+
 import pytest
 
 from rea_team import checks, config, features as featmod
 from rea_team.cli import main
 from rea_team.errors import (ConfigError, ContractViolation, FeatureGraphError, LeakDetected,
                              ReportFormatError, StepFailed, TransientError)
-from rea_team.preflight import agent_tools, extract_rea_tools, node_ok
+from rea_team.errors import ReaTeamError
+from rea_team.preflight import agent_tools, extract_rea_tools, list_mcp_tools, node_ok
 from rea_team.runner import Runner, with_retries
 from rea_team.state import FeatureState, ProjectState
 
@@ -152,6 +155,56 @@ def test_set_tools(tmp_path, monkeypatch):
     assert main(["set-tools", "--from-doctor", str(doc)]) == 0
     tools = agent_tools(tmp_path / "w/lab/.claude/agents/analyst.md")
     assert "mcp__rea__open_binary" in tools and "Read" in tools
+
+
+FAKE_MCP = r"""
+import json, sys
+pages = {None: (["open_binary", "list_strings"], "p2"), "p2": (["decompile"], None)}
+print("starting up")  # stray stdout noise must be skipped
+sys.stdout.flush()
+for line in sys.stdin:
+    m = json.loads(line)
+    if "id" not in m:
+        continue
+    if m["method"] == "initialize":
+        r = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}
+    else:
+        names, nxt = pages[m["params"].get("cursor")]
+        r = {"tools": [{"name": n} for n in names], **({"nextCursor": nxt} if nxt else {})}
+    print(json.dumps({"jsonrpc": "2.0", "id": m["id"], "result": r}))
+    sys.stdout.flush()
+"""
+
+
+def test_set_tools_from_mcp(tmp_path, monkeypatch):
+    server = tmp_path / "fake_mcp.py"
+    server.write_text(FAKE_MCP)
+    cmd = f"{sys.executable} -I {server}"
+    assert list_mcp_tools(cmd, timeout=20) == ["mcp__rea__open_binary", "mcp__rea__list_strings",
+                                               "mcp__rea__decompile"]
+    main(["init", str(tmp_path / "w")])
+    monkeypatch.chdir(tmp_path / "w")
+    assert main(["set-tools", "--from-mcp", cmd]) == 0
+    assert "mcp__rea__decompile" in agent_tools(tmp_path / "w/lab/.claude/agents/analyst.md")
+
+
+def test_list_mcp_tools_failures(tmp_path):
+    with pytest.raises(ReaTeamError, match="Cannot start"):
+        list_mcp_tools(str(tmp_path / "no-such-server"))
+    silent = tmp_path / "silent.py"
+    silent.write_text("import time; time.sleep(30)")
+    with pytest.raises(ReaTeamError, match="did not answer"):
+        list_mcp_tools(f"{sys.executable} -I {silent}", timeout=1)
+    with pytest.raises(ReaTeamError, match="exited"):
+        list_mcp_tools(f"{sys.executable} -I -c pass", timeout=10)
+
+
+def test_doctor_json_appended_twice(tmp_path):
+    doc = tmp_path / "doctor.json"
+    doc.write_text('{"a": 1}{"a": 1}')
+    with pytest.raises(ReaTeamError) as e:
+        extract_rea_tools(doc)
+    assert "more than one JSON document" in e.value.hint
 
 
 def test_commented_example_is_not_a_feature(tmp_path):
