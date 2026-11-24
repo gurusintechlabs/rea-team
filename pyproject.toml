@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rea-team"
+version = "0.1.0"
+description = "Clean-room reverse engineering team for Claude Code + REA, with checkpoints and resume"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+rea-team = "rea_team.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+rea_team = ["templates/**/*", "templates/**/.claude/agents/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
